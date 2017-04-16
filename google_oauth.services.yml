@@ -1,0 +1,4 @@
+services:
+  google_oauth.client:
+    class: 'Drupal\google_oauth\GoogleOAuthClient'
+    arguments: ['@config.factory', '@url_generator']

@@ -4,93 +4,133 @@
  */
 namespace Drupal\google_oauth\Controller;
 
+use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\Core\Controller\ControllerBase;
+use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
+use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Extension\ModuleHandlerInterface;
 use Drupal\Core\Routing\TrustedRedirectResponse;
-use Drupal\Core\StreamWrapper\PrivateStream;
-use Drupal\user\Entity\User;
-use Google_Client;
-use Google_Service_Oauth2;
+use Psr\Log\LogLevel;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\HttpFoundation\RedirectResponse;
+use Symfony\Component\HttpFoundation\Request;
 
-class GoogleOAuthController extends ControllerBase {
+class GoogleOAuthController extends ControllerBase implements ContainerInjectionInterface {
+
   private $client;
 
-  public function __construct() {
-    $private_path = PrivateStream::basePath();
-    $config_file = $private_path . '/google-oauth-secret.json';
+  private $config;
 
-    if (!is_readable($config_file)) {
-      // Nag ?
-      return;
-    }
+  private $externalAuth;
 
-    $this->client = new Google_Client();
-    $this->client->setAuthConfigFile($config_file);
-    $this->client->setScopes(array('email'));
-    $this->client->setState('offline');
+  private $moduleHandler;
 
-    // Set the redirect URL which is used when redirecting and verifying
-    // the one-time oauth code.
-    $uri = \Drupal::url('google_oauth.authenticate', array(), array('absolute' => TRUE));
+  private $requestStack;
 
-    $this->client->setRedirectUri($uri);
+  public function __construct(
+    \Google_Client $client,
+    ConfigFactoryInterface $configFactory,
+    ExternalAuthInterface $externalAuth,
+    LoggerChannelInterface $logger,
+    ModuleHandlerInterface $moduleHandler,
+    RequestStackInterface $requestStack
+  ) {
+    $this->client = $client;
+    $this->config = $configFactory->get('google_oauth.settings');
+    $this->externalAuth = $externalAuth;
+    $this->logger = $logger;
+    $this->moduleHandler = $moduleHandler;
+    $this->requestStack = $requestStack;
+  }
+
+  public static function create(ContainerInterface $container) {
+    new static(
+      $container->get('google_oauth.client'),
+      $container->get('config.factory'),
+      $container->get('externalauth.externalauth'),
+      $container->get('logger.channel.externalauth'),
+      $container->get('module_handler'),
+      $container->get('request_stack')
+    );
   }
 
   public function login() {
     if (!$this->client) {
-      return;
+      return false;
     }
 
     return new TrustedRedirectResponse($this->client->createAuthUrl(), 301);
   }
 
-  /**
-   * Authenticate, save user details, return access token
-   */
   public function authenticate() {
-    $code = filter_input(INPUT_GET, 'code');
+    if (!$this->client) {
+      $this->logger->log(
+        LogLevel::ERROR,
+        'There was an error loading the Google OAuth client.',
+        $request->query->all()
+      );
 
-    if (empty($code) || !$this->client) {
-      return new RedirectResponse('/');
+      return new RedirectResponse($this->config->get('page_error_location'));
+    }
+
+    $request = $this->requestStack->getMasterRequest();
+    $code = $request->query->get('code');
+
+    if (!$request->query->has('code')) {
+      $this->logger->log(
+        LogLevel::ERROR,
+        'The code parameter was empty.',
+        $request->query->all()
+      );
+
+      return new RedirectResponse($this->config->get('page_error_location'));
     }
 
     try {
       $this->client->authenticate($code);
     }
     catch (\Exception $e) {
-      return new RedirectResponse('/');
+      $this->logger->log(LogLevel::ERROR, $e->getMessage());
+
+      return new RedirectResponse($this->config->get('page_error_location'));
     }
 
-    $plus = new Google_Service_Oauth2($this->client);
-    $userinfo = $plus->userinfo->get();
+    $oauth = new \Google_Service_Oauth2($this->client);
+    $userData = $oauth->userinfo->get();
 
-    $user_email = $userinfo['email'];
+    // @todo add event handler
+    $this->moduleHandler->alter(
+      'google_oauth_user_data',
+      $userData
+    );
 
-    $user = user_load_by_mail($user_email);
+    // Pass the account information received to the ExternalAuth service to
+    // either login or register the user.
+    try {
+      $account = $this->externalAuth->loginRegister(
+        $userData['email'],
+        'google_oauth',
+        [
+          'name' => $userData['name'],
+          'status' => TRUE,
+          'mail' => $userData['email'],
+          'picture' => $userData['picture'],
+        ]
+      );
+    }
+    catch (\Exception $e) {
+      $this->logger->log(LogLevel::ERROR, $e->getMessage());
 
-    if (!$user) {
-      $user_name = $userinfo['name'];
-      $user_picture = $userinfo['picture'];
-
-      try {
-        $user = User::create([
-          'name' => $user_name,
-          'mail' => $user_email,
-          'status' => 1,
-          'picture' => $user_picture,
-        ]);
-
-        // hook_google_oauth_create_user_alter($user, $userinfo);
-        \Drupal::moduleHandler()->alter('google_oauth_create_user', $user, $userinfo);
-        $user->save();
-      }
-      catch (\Exception $e) {
-        return new RedirectResponse('/');
-      }
+      return new RedirectResponse($this->config->get('page_error_location'));
     }
 
-    user_login_finalize($user);
+    // @todo add event handler
+    $this->moduleHandler->invokeAll(
+      'google_oauth_user_login_register',
+      $account,
+      $userData
+    );
 
-    return $this->redirect('<front>');
+    return new RedirectResponse($this->config->get('page_success_location'));
   }
 }
